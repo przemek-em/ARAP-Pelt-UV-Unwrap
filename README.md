@@ -7,6 +7,8 @@ Optimized for **rocks, cliffs, and natural environment assets** where uniform te
 ![Python](https://img.shields.io/badge/Python-3.8%2B-blue)
 ![License](https://img.shields.io/badge/License-MIT-green)
 
+![Screenshot](screenshot.png)
+
 ## Features
 
 - **ARAP Pelt Unwrap** — single-island unwrap with free-boundary ARAP iterations, the gold standard for minimizing stretch distortion
