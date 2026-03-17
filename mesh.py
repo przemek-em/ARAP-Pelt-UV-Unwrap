@@ -12,7 +12,7 @@ class Mesh:
         self.vertices = np.zeros((0, 3), dtype=np.float64)
         self.normals = np.zeros((0, 3), dtype=np.float64)
         self.uvs = np.zeros((0, 2), dtype=np.float64)
-        self.faces = []             # list of list[int] — vertex indices (0-based)
+        self.faces = []             # list of list[int] - vertex indices (0-based)
         self.face_normals_idx = []  # list of list[int]
         self.face_uvs_idx = []      # list of list[int]
         self.face_normals_computed = np.zeros((0, 3), dtype=np.float64)

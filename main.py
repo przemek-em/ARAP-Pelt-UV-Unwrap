@@ -9,6 +9,7 @@ exporting the result.
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
 import math
+import logging
 import numpy as np
 import threading
 import os
@@ -22,6 +23,87 @@ try:
     HAS_PIL = True
 except ImportError:
     HAS_PIL = False
+
+
+# ======================================================================
+# Log panel
+# ======================================================================
+
+class LogPanel(ttk.LabelFrame):
+    """Collapsible log/console panel that captures Python logging."""
+
+    def __init__(self, parent, **kw):
+        super().__init__(parent, text="Log", **kw)
+        self._build_ui()
+        self._setup_logging()
+
+    def _build_ui(self):
+        # Toolbar row: Clear + auto-scroll toggle
+        bar = ttk.Frame(self)
+        bar.pack(fill="x", padx=2, pady=(2, 0))
+        ttk.Button(bar, text="Clear", command=self.clear).pack(side="left", padx=2)
+        self._auto_var = tk.BooleanVar(value=True)
+        ttk.Checkbutton(bar, text="Auto-scroll", variable=self._auto_var).pack(side="left", padx=2)
+
+        # Text widget with scrollbar
+        frame = ttk.Frame(self)
+        frame.pack(fill="both", expand=True, padx=2, pady=2)
+        self._text = tk.Text(
+            frame, height=6, wrap="word", state="disabled",
+            bg="#1a1a2e", fg="#cccccc", insertbackground="#ccc",
+            selectbackground="#445", font=("Consolas", 9),
+            borderwidth=0, highlightthickness=0,
+        )
+        sb = ttk.Scrollbar(frame, orient="vertical", command=self._text.yview)
+        self._text.configure(yscrollcommand=sb.set)
+        sb.pack(side="right", fill="y")
+        self._text.pack(side="left", fill="both", expand=True)
+
+        # Tag colours for severity levels
+        self._text.tag_configure("INFO", foreground="#8ec07c")
+        self._text.tag_configure("WARNING", foreground="#fabd2f")
+        self._text.tag_configure("ERROR", foreground="#fb4934")
+        self._text.tag_configure("DEBUG", foreground="#83a598")
+
+    def _setup_logging(self):
+        """Install a logging handler that writes to this panel."""
+        self._handler = _TkLogHandler(self)
+        self._handler.setFormatter(
+            logging.Formatter("%(asctime)s  %(levelname)-7s  %(message)s",
+                              datefmt="%H:%M:%S"))
+        root_logger = logging.getLogger("uv_unwrap")
+        root_logger.setLevel(logging.DEBUG)
+        root_logger.addHandler(self._handler)
+
+    def append(self, text, tag=None):
+        """Thread-safe append."""
+        self._text.configure(state="normal")
+        self._text.insert("end", text + "\n", tag)
+        self._text.configure(state="disabled")
+        if self._auto_var.get():
+            self._text.see("end")
+
+    def clear(self):
+        self._text.configure(state="normal")
+        self._text.delete("1.0", "end")
+        self._text.configure(state="disabled")
+
+
+class _TkLogHandler(logging.Handler):
+    """Routes log records from any thread to the LogPanel on the main thread."""
+
+    def __init__(self, panel: LogPanel):
+        super().__init__()
+        self._panel = panel
+
+    def emit(self, record):
+        msg = self.format(record)
+        tag = record.levelname  # INFO, WARNING, ERROR, DEBUG
+        try:
+            self._panel.winfo_toplevel().after(
+                0, lambda: self._panel.append(msg, tag))
+        except Exception:
+            pass  # widget destroyed
 
 
 # ======================================================================
@@ -173,7 +255,7 @@ class UVCanvas(tk.Canvas):
 class UVUnwrapApp:
     def __init__(self, root):
         self.root = root
-        self.root.title("UV As-Rigid-As-Possible Pelt Unwrap Tool")
+        self.root.title("As-Rigid-As-Possible UV Pelt Unwrap Tool")
         self.root.geometry("1300x780")
         self.root.minsize(900, 550)
         self.root.configure(bg="#222")
@@ -186,6 +268,7 @@ class UVUnwrapApp:
         self._build_toolbar()
         self._build_panes()
         self._build_controls()
+        self._build_log()
         self._build_status()
 
     # ------------------------------------------------------------------
@@ -279,6 +362,19 @@ class UVUnwrapApp:
         self._param_widgets = {}
         self._update_param_ui()
 
+        # Flip UV controls - for meshes that unwrap upside-down or mirrored
+        sep = ttk.Separator(cf, orient="vertical")
+        sep.pack(side="left", fill="y", padx=6)
+        flip_frame = ttk.Frame(cf)
+        flip_frame.pack(side="left", padx=6, pady=4)
+        ttk.Button(flip_frame, text="Flip U", command=self._flip_u).pack(side="left", padx=2)
+        ttk.Button(flip_frame, text="Flip V", command=self._flip_v).pack(side="left", padx=2)
+
+        ttk.Separator(cf, orient="vertical").pack(side="left", fill="y", padx=6)
+        self._flip_proj_var = tk.BooleanVar(value=False)
+        ttk.Checkbutton(cf, text="Flip Projection",
+                        variable=self._flip_proj_var).pack(side="left", padx=4, pady=4)
+
     def _build_status(self):
         sf = ttk.Frame(self.root)
         sf.pack(fill="x", side="bottom", padx=4, pady=(0, 4))
@@ -286,6 +382,13 @@ class UVUnwrapApp:
         ttk.Label(sf, textvariable=self.status_var, anchor="w").pack(side="left", fill="x", expand=True)
         self.info_var = tk.StringVar(value="")
         ttk.Label(sf, textvariable=self.info_var, anchor="e").pack(side="right")
+
+    def _build_log(self):
+        self.log_panel = LogPanel(self.root)
+        self.log_panel.pack(fill="x", padx=4, pady=(0, 2))
+        # Write an initial message
+        logger = logging.getLogger("uv_unwrap")
+        logger.info("Application started.")
 
     # ------------------------------------------------------------------
     # Parameter UI (dynamic based on algorithm)
@@ -303,7 +406,8 @@ class UVUnwrapApp:
             col += 1
             if isinstance(default, float):
                 var = tk.DoubleVar(value=default)
-                sp = ttk.Spinbox(self.param_frame, from_=lo, to=hi, increment=0.001,
+                inc = 0.01 if (hi - lo) > 0.1 else 0.001
+                sp = ttk.Spinbox(self.param_frame, from_=lo, to=hi, increment=inc,
                                  textvariable=var, width=8)
             else:
                 var = tk.IntVar(value=default) if isinstance(default, int) else tk.DoubleVar(value=default)
@@ -324,12 +428,15 @@ class UVUnwrapApp:
         )
         if not path:
             return
+        logger = logging.getLogger("uv_unwrap")
+        logger.info("Loading %s…", os.path.basename(path))
         self.status_var.set(f"Loading {os.path.basename(path)}…")
         self.root.update_idletasks()
         try:
             self.mesh = load_obj(path)
             self._filepath = path
         except Exception as exc:
+            logger.error("Failed to load OBJ: %s", exc)
             messagebox.showerror("Error", f"Failed to load OBJ:\n{exc}")
             self.status_var.set("Error loading file.")
             return
@@ -337,6 +444,7 @@ class UVUnwrapApp:
         nf = len(self.mesh.faces)
         has_uv = "yes" if len(self.mesh.face_uvs_idx) == len(self.mesh.faces) else "no"
         self.info_var.set(f"Verts: {nv}  |  Faces: {nf}  |  Has UVs: {has_uv}")
+        logger.info("Loaded: %d verts, %d faces, UVs=%s.",nv, nf, has_uv)
         self.status_var.set(f"Loaded {os.path.basename(path)}")
         self.viewport.set_mesh(self.mesh)
         self.uv_canvas.set_mesh(self.mesh)
@@ -352,6 +460,9 @@ class UVUnwrapApp:
             var = self._param_widgets.get(name)
             if var is not None:
                 kwargs[name] = var.get()
+        kwargs["flip_projection"] = self._flip_proj_var.get()
+        kwargs["quality_threshold"] = self._param_widgets.get(
+            "quality_threshold", tk.DoubleVar(value=0.0)).get()
 
         self.status_var.set("Unwrapping with Pelt ARAP…")
         self.root.update_idletasks()
@@ -362,6 +473,7 @@ class UVUnwrapApp:
                 self.islands = [list(range(len(self.mesh.faces)))]
                 self.root.after(0, self._post_unwrap)
             except Exception as exc:
+                logging.getLogger("uv_unwrap").error("Unwrap failed: %s", exc)
                 self.root.after(0, lambda: messagebox.showerror("Error", str(exc)))
                 self.root.after(0, lambda: self.status_var.set("Unwrap failed."))
 
@@ -369,7 +481,17 @@ class UVUnwrapApp:
 
     def _post_unwrap(self):
         nuv = len(self.mesh.uvs)
-        self.status_var.set(f"Pelt ARAP complete — {nuv} UV coords generated.")
+        # Warn if UVs look degenerate (all nearly the same point)
+        if nuv > 0:
+            import numpy as np
+            span = self.mesh.uvs.max(axis=0) - self.mesh.uvs.min(axis=0)
+            if span[0] < 0.01 and span[1] < 0.01:
+                self.status_var.set(
+                    f"Unwrap done ({nuv} UVs) - WARNING: island is very small, "
+                    "mesh may have degenerate geometry.")
+                self.uv_canvas.set_mesh(self.mesh, self.islands)
+                return
+        self.status_var.set(f"Pelt ARAP complete - {nuv} UV coords generated.")
         self.uv_canvas.set_mesh(self.mesh, self.islands)
         # Refresh 3D viewport to show seams
         if hasattr(self.viewport, "set_mesh"):
@@ -459,6 +581,32 @@ class UVUnwrapApp:
     def _on_checker_scale_changed(self):
         if hasattr(self.viewport, "set_checker_scale"):
             self.viewport.set_checker_scale(self._checker_scale_var.get())
+
+    # ------------------------------------------------------------------
+    # UV flip helpers
+    # ------------------------------------------------------------------
+
+    def _flip_u(self):
+        """Mirror the UV island horizontally (flip U axis)."""
+        if self.mesh is None or len(self.mesh.uvs) == 0:
+            return
+        self.mesh.uvs[:, 0] = 1.0 - self.mesh.uvs[:, 0]
+        self.uv_canvas.set_mesh(self.mesh, self.islands)
+        if hasattr(self.viewport, "set_mesh"):
+            self.viewport.set_mesh(self.mesh)
+        logging.getLogger("uv_unwrap").info("Flipped U axis.")
+        self.status_var.set("UV flipped horizontally (U).")
+
+    def _flip_v(self):
+        """Mirror the UV island vertically (flip V axis)."""
+        if self.mesh is None or len(self.mesh.uvs) == 0:
+            return
+        self.mesh.uvs[:, 1] = 1.0 - self.mesh.uvs[:, 1]
+        self.uv_canvas.set_mesh(self.mesh, self.islands)
+        if hasattr(self.viewport, "set_mesh"):
+            self.viewport.set_mesh(self.mesh)
+        logging.getLogger("uv_unwrap").info("Flipped V axis.")
+        self.status_var.set("UV flipped vertically (V).")
 
 
 # ======================================================================

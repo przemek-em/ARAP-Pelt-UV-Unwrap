@@ -17,9 +17,12 @@ solvers for interactive performance on meshes up to ~50k faces.
 """
 
 import math
+import logging
 import numpy as np
 from collections import deque
 import heapq
+
+logger = logging.getLogger("uv_unwrap")
 
 try:
     from scipy import sparse
@@ -47,6 +50,31 @@ except ImportError:
 # ======================================================================
 
 
+def _orient_pca_projection(eigvecs, face_normals):
+    """
+    Orient PCA eigenvectors so that the projection views the mesh from
+    the dominant-normal side (i.e. the side most faces point towards).
+
+    The projection plane is spanned by eigvecs[:, 2] and eigvecs[:, 1].
+    The discarded axis eigvecs[:, 0] is the projection normal.  If it
+    opposes the area-weighted average face normal we negate eigvec 2
+    so the UV island shows the "top" / outer side of the mesh.
+    """
+    if len(face_normals) == 0:
+        return eigvecs
+    avg_n = face_normals.mean(axis=0)
+    length = np.linalg.norm(avg_n)
+    if length < 1e-10:
+        return eigvecs
+    avg_n /= length
+    proj_normal = eigvecs[:, 0]
+    if np.dot(proj_normal, avg_n) < 0:
+        eigvecs = eigvecs.copy()
+        eigvecs[:, 2] *= -1  # mirror U axis → view from opposite side
+        logger.info("PCA projection auto-oriented to dominant normal side.")
+    return eigvecs
+
+
 def _build_local_mesh(mesh):
     v2local = {}
     order = []
@@ -59,6 +87,40 @@ def _build_local_mesh(mesh):
     for face in mesh.faces:
         faces_local.append([v2local[vi] for vi in face])
     return order, faces_local, v2local
+
+
+def _compute_face_quality(mesh):
+    """
+    Compute a per-face quality score in [0, 1].
+
+    Quality is based on the ratio of triangle area to the area of an
+    equilateral triangle with the same longest edge.  Degenerate (sliver
+    or near-zero-area) triangles score close to 0; well-shaped triangles
+    score close to 1.
+    """
+    verts = mesh.vertices
+    n_faces = len(mesh.faces)
+    quality = np.ones(n_faces, dtype=np.float64)
+    for fi, face in enumerate(mesh.faces):
+        if len(face) < 3:
+            quality[fi] = 0.0
+            continue
+        v0 = verts[face[0]]
+        v1 = verts[face[1]]
+        v2 = verts[face[2]]
+        e0 = v1 - v0
+        e1 = v2 - v0
+        e2 = v2 - v1
+        area = 0.5 * np.linalg.norm(np.cross(e0, e1))
+        max_edge = max(np.linalg.norm(e0), np.linalg.norm(e1),
+                       np.linalg.norm(e2))
+        if max_edge < 1e-14:
+            quality[fi] = 0.0
+            continue
+        # Ratio vs equilateral triangle with same longest edge
+        ideal_area = (math.sqrt(3) / 4.0) * max_edge * max_edge
+        quality[fi] = min(area / ideal_area, 1.0)
+    return quality
 
 
 def _find_boundary_ordered(faces_local, n_verts):
@@ -361,7 +423,7 @@ def _build_arap_data(order, faces_arr, n_verts, mesh_verts):
     n_tri = len(faces_arr)
     faces_np = np.array(faces_arr, dtype=int)  # (n_tri, 3)
 
-    # Triangle 3D positions (n_tri, 3, 3) — vectorized gather
+    # Triangle 3D positions (n_tri, 3, 3) - vectorized gather
     order_arr = np.array(order, dtype=int)
     tri_p = mesh_verts[order_arr[faces_np]]  # (n_tri, 3, 3)
 
@@ -478,7 +540,19 @@ def _arap_local_step(uvs, arap_data):
 
     # Batched SVD on valid triangles only
     S_valid = S[vm]
-    U, _, Vt = np.linalg.svd(S_valid)
+    try:
+        U, _, Vt = np.linalg.svd(S_valid)
+    except np.linalg.LinAlgError:
+        # Fall back to per-triangle SVD, skipping degenerate ones
+        n_valid = S_valid.shape[0]
+        U = np.zeros((n_valid, 2, 2))
+        Vt = np.zeros((n_valid, 2, 2))
+        for i in range(n_valid):
+            try:
+                U[i], _, Vt[i] = np.linalg.svd(S_valid[i])
+            except np.linalg.LinAlgError:
+                U[i] = np.eye(2)
+                Vt[i] = np.eye(2)
     R = np.einsum('tji,tki->tjk', Vt, U)  # Vt.T @ U.T
 
     # Fix reflections: det(R) < 0
@@ -578,7 +652,8 @@ def _arap_global_step_fast(uvs, arap_data, rotations):
 # Main entry point
 # ------------------------------------------------------------------
 
-def pelt_unwrap(mesh, arap_iterations=50, island_margin=0.01):
+def pelt_unwrap(mesh, arap_iterations=50, island_margin=0.01,
+                flip_projection=False, quality_threshold=0.0):
     """
     Pelt UV unwrap -- single-island, ARAP parameterization.
 
@@ -589,32 +664,81 @@ def pelt_unwrap(mesh, arap_iterations=50, island_margin=0.01):
         More = more even UVs.  50 is usually enough.
     island_margin : float
         Margin around the island in UV space.
+    flip_projection : bool
+        When True, project from the opposite side of the mesh.
+        Useful for broken meshes where the default PCA orientation
+        captures the wrong side.
+    quality_threshold : float
+        Faces with quality below this value (0–1) are excluded from UV
+        computation and assigned collapsed UVs.  0 = keep all faces
+        (default), 0.01–0.05 = remove severely degenerate slivers.
     """
     if len(mesh.faces) == 0:
+        logger.warning("Mesh has no faces - nothing to unwrap.")
         return
+
+    logger.info("Starting Pelt ARAP unwrap (%d faces, %d verts, "
+                "iterations=%d, margin=%.3f).",
+                len(mesh.faces), len(mesh.vertices),
+                arap_iterations, island_margin)
 
     if len(mesh.face_normals_computed) == 0:
         mesh.compute_face_normals()
 
+    # 0. Filter degenerate faces if quality_threshold > 0
+    original_faces = mesh.faces
+    original_normals = mesh.face_normals_computed
+    removed_face_indices = []
+    if quality_threshold > 0:
+        face_quality = _compute_face_quality(mesh)
+        good_mask = face_quality >= quality_threshold
+        n_removed = int(np.sum(~good_mask))
+        if n_removed > 0:
+            logger.info("Quality filter: removing %d / %d degenerate faces "
+                        "(threshold=%.4f).", n_removed, len(mesh.faces),
+                        quality_threshold)
+            removed_face_indices = list(np.where(~good_mask)[0])
+            mesh.faces = [f for f, g in zip(original_faces, good_mask) if g]
+            mesh.face_normals_computed = original_normals[good_mask]
+        else:
+            logger.info("Quality filter: all faces above threshold.")
+
+    if len(mesh.faces) == 0:
+        logger.warning("All faces were filtered out - restoring original.")
+        mesh.faces = original_faces
+        mesh.face_normals_computed = original_normals
+        removed_face_indices = []
+
     # 1. Build local mesh
     order, faces_local, v2local = _build_local_mesh(mesh)
     n_verts = len(order)
+    logger.info("Local mesh: %d vertices.", n_verts)
 
     # 2. Find or create boundary
     boundary = _find_boundary_ordered(faces_local, n_verts)
+    logger.info("Boundary vertices: %d.", len(boundary))
 
     if len(boundary) < 3:
+        logger.info("Boundary too small - running auto-seam.")
         order, faces_local, n_verts = _auto_seam(
             mesh, order, faces_local, n_verts)
         boundary = _find_boundary_ordered(faces_local, n_verts)
+        logger.info("After auto-seam: %d boundary verts, %d total verts.",
+                    len(boundary), n_verts)
 
     if len(boundary) < 3:
         # Fallback: PCA planar projection
+        logger.warning("Still no valid boundary - falling back to PCA projection.")
         verts = mesh.vertices
         center = verts.mean(axis=0)
         centered = verts - center
         cov = centered.T @ centered
         _, eigvecs = np.linalg.eigh(cov)
+        eigvecs = _orient_pca_projection(eigvecs, mesh.face_normals_computed)
+        if flip_projection:
+            eigvecs = eigvecs.copy()
+            eigvecs[:, 2] *= -1
+            logger.info("Flip-projection enabled - viewing from opposite side.")
         uvs_flat = centered @ eigvecs[:, [2, 1]]
         for k in range(2):
             mn, mx = uvs_flat[:, k].min(), uvs_flat[:, k].max()
@@ -658,8 +782,34 @@ def pelt_unwrap(mesh, arap_iterations=50, island_margin=0.01):
                               boundary_set, n_verts, 200)
 
     # 4. ARAP iterations (free boundary)
+    logger.info("Running %d ARAP iterations…", arap_iterations)
     faces_arr = [list(fl) for fl in faces_local]
     _run_arap(uvs, faces_arr, order, mesh.vertices, n_verts, arap_iterations)
+
+    # 4b. Sanitize: replace NaN / Inf with 0 so the island stays visible
+    bad_mask = ~np.isfinite(uvs)
+    n_bad = int(np.sum(bad_mask))
+    if n_bad:
+        uvs[bad_mask] = 0.0
+        logger.warning("Sanitized %d NaN/Inf UV values.", n_bad)
+
+    # 4c. Check if UVs collapsed to a point (degenerate mesh)
+    span = uvs.max(axis=0) - uvs.min(axis=0)
+    if span[0] < 1e-10 and span[1] < 1e-10:
+        # Fall back to simple PCA planar projection so something is visible
+        logger.warning("ARAP produced collapsed UVs - falling back to PCA "
+                       "projection. The mesh may have degenerate triangles.")
+        verts3d = mesh.vertices[order]
+        center3d = verts3d.mean(axis=0)
+        centered3d = verts3d - center3d
+        cov3d = centered3d.T @ centered3d
+        _, evecs = np.linalg.eigh(cov3d)
+        evecs = _orient_pca_projection(evecs, mesh.face_normals_computed)
+        if flip_projection:
+            evecs = evecs.copy()
+            evecs[:, 2] *= -1
+            logger.info("Flip-projection enabled - viewing from opposite side.")
+        uvs = centered3d @ evecs[:, [2, 1]]
 
     # 5. Normalize to [margin, 1-margin]
     for k in range(2):
@@ -673,6 +823,31 @@ def pelt_unwrap(mesh, arap_iterations=50, island_margin=0.01):
     # 6. Write back
     mesh.uvs = uvs
     mesh.face_uvs_idx = [list(fl) for fl in faces_local]
+
+    # 6b. Restore filtered faces and assign them collapsed UVs
+    if removed_face_indices:
+        mesh.faces = original_faces
+        mesh.face_normals_computed = original_normals
+        # Map good-face index back to original index
+        good_indices = sorted(set(range(len(original_faces))) -
+                              set(removed_face_indices))
+        # Rebuild face_uvs_idx for original face ordering
+        good_fuv = mesh.face_uvs_idx  # from the unwrapped good faces
+        full_fuv = [None] * len(original_faces)
+        for new_fi, orig_fi in enumerate(good_indices):
+            full_fuv[orig_fi] = good_fuv[new_fi]
+        # For removed faces: map their verts to existing UV indices (or add
+        # a collapsed UV point at the island centre).
+        centre_uv = mesh.uvs.mean(axis=0)
+        collapse_idx = len(mesh.uvs)
+        mesh.uvs = np.vstack([mesh.uvs, centre_uv[None, :]])
+        for orig_fi in removed_face_indices:
+            full_fuv[orig_fi] = [collapse_idx] * len(original_faces[orig_fi])
+        mesh.face_uvs_idx = full_fuv
+        logger.info("Restored %d filtered faces with collapsed UVs.",
+                    len(removed_face_indices))
+
+    logger.info("Unwrap complete - %d UV coordinates generated.", len(mesh.uvs))
 
 
 def _harmonic_jacobi_fast(uvs, faces_local, order, mesh_verts,
@@ -715,4 +890,5 @@ def _harmonic_jacobi_fast(uvs, faces_local, order, mesh_verts,
 ALGORITHM_PARAMS = {
     "arap_iterations": (1, 200, 50),
     "island_margin": (0.0, 0.05, 0.01),
+    "quality_threshold": (0.0, 0.5, 0.0),
 }

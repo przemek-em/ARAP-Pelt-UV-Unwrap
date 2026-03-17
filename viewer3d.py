@@ -29,7 +29,7 @@ if HAS_OPENGL:
         """Interactive OpenGL 3D viewport embedded in Tkinter."""
 
         def __init__(self, master=None, **kw):
-            # Instance state — survives GL context recreation on resize
+            # Instance state - survives GL context recreation on resize
             self._az = 45.0
             self._el = 25.0
             self._dist = 5.0
@@ -54,7 +54,7 @@ if HAS_OPENGL:
             self.bind("<B2-Motion>", self._on_mmb_drag)
 
         def initgl(self):
-            # Only GL state here — called each time the context is (re)created
+            # Only GL state here - called each time the context is (re)created
             self._checker_tex = None  # old texture ID is invalid
             self._last_w = self.winfo_width()
             self._last_h = self.winfo_height()
@@ -134,7 +134,7 @@ if HAS_OPENGL:
             """Create a 2x2 checker tile; repetition is handled via UV scale."""
             if self._checker_tex is not None:
                 return
-            # Simple 2x2 texel checker — tiled by GL_REPEAT
+            # Simple 2x2 texel checker - tiled by GL_REPEAT
             pixels = np.array([
                 [200, 200, 200,  80,  80,  80],
                 [ 80,  80,  80, 200, 200, 200],
@@ -161,7 +161,7 @@ if HAS_OPENGL:
                 self._last_h = h
                 self._checker_tex = None
 
-            # Re-apply GL state every frame — pyopengltk can
+            # Re-apply GL state every frame - pyopengltk can
             # recreate the context/FBO on resize, losing all state.
             glClearColor(0.18, 0.20, 0.22, 1.0)
             glEnable(GL_DEPTH_TEST)
